@@ -1,20 +1,16 @@
-# --- Base image ---
+# Используем стабильную версию Python 3.12 (а не 3.13!)
 FROM python:3.12-slim
 
-# --- System dependencies ---
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-
-# --- Workdir setup ---
+# Устанавливаем рабочую директорию
 WORKDIR /app
 
-# --- Copy files ---
+# Обновляем pip и ставим зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
+# Копируем все файлы проекта
 COPY . .
 
-# --- Environment ---
-ENV PYTHONUNBUFFERED=1
-
-# --- Start bot ---
+# Запускаем бота
 CMD ["python", "bot.py"]
