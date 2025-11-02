@@ -3,9 +3,9 @@ import logging
 import subprocess
 import tempfile
 import io
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
-from telegram import File
+import asyncio
+from telegram import Update, File
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 
 # Настройка логирования
@@ -16,33 +16,62 @@ logger = logging.getLogger(__name__)
 
 # Настройки
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CLIENT = OpenAI(base_url=os.environ.get("OPENAI_API_BASE"))
-LLM_MODEL = "gemini-2.5-flash"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN environment variable not set.")
+    exit(1)
+
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY environment variable not set.")
+    exit(1)
+
+# Инициализация клиента OpenAI
+CLIENT = OpenAI(api_key=OPENAI_API_KEY)
+LLM_MODEL = "gpt-3.5-turbo"
 
 # --- LLM Integration Functions ---
 
 def get_llm_response(prompt: str) -> str:
     """Получает ответ от LLM."""
     try:
+        system_prompt = """
+Ты - профессиональный психолог с 15-летним опытом работы. Твоя задача - оказывать психологическую поддержку.
+
+Твой стиль общения:
+- Поддерживающий и эмпатичный
+- Профессиональный и этичный
+- Конкретный и практичный
+- Основанный на принципах доказательной психологии
+
+Важные правила:
+1. Не ставь медицинские диагнозы
+2. Не заменяй очную консультацию
+3. В кризисных ситуациях направляй к специалистам
+4. Сосредоточься на активном слушании и поддержке
+"""
+        
         response = CLIENT.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": "Ты - дружелюбный и полезный ассистент, созданный на основе технологии Manus. Ты можешь свободно общаться с пользователем на русском языке."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            max_tokens=500,
+            temperature=0.7
         )
         return response.choices[0].message.content
     except Exception as e:
         logger.error(f"Error getting LLM response: {e}")
-        return "Извините, произошла ошибка при обращении к модели."
+        return "Благодарю вас за обращение. В настоящий момент я испытываю технические трудности. Пожалуйста, попробуйте написать ваш вопрос еще раз."
 
 # --- Speech Integration Functions (STT/TTS) ---
 
 async def transcribe_voice_message(voice_file: File) -> str:
-    """Скачивает голосовое сообщение, конвертирует и распознает его с помощью Manus STT."""
+    """Скачивает голосовое сообщение, конвертирует и распознает его с помощью Whisper."""
+    ogg_path = None
+    mp3_path = None
+    
     try:
         # 1. Скачивание файла во временную папку
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as ogg_file:
@@ -51,42 +80,55 @@ async def transcribe_voice_message(voice_file: File) -> str:
         await voice_file.download_to_drive(ogg_path)
         logger.info(f"Downloaded voice file to {ogg_path}")
 
-        # 2. Конвертация OGG (Telegram) в MP3 (для Manus STT) с помощью ffmpeg
+        # 2. Конвертация OGG в MP3 для Whisper
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
             mp3_path = mp3_file.name
         
         logger.info(f"Converting audio from {ogg_path} to {mp3_path}")
         
-        result = subprocess.run(
-            ["ffmpeg", "-i", ogg_path, "-acodec", "libmp3lame", "-ab", "192k", mp3_path, "-y"],
-            capture_output=True,
-            text=True
-        )
+        result = subprocess.run([
+            "ffmpeg", "-i", ogg_path, 
+            "-acodec", "libmp3lame", 
+            "-ab", "128k",
+            "-ac", "1",
+            mp3_path, "-y"
+        ], capture_output=True, text=True, timeout=30)
         
         if result.returncode != 0:
             logger.error(f"FFmpeg error: {result.stderr}")
-            os.unlink(ogg_path)
             return ""
-        
-        os.unlink(ogg_path)
 
-        # 3. Распознавание речи (STT) с помощью Manus API
-        with open(mp3_path, "rb") as mp3_file:
+        # 3. Распознавание речи с помощью Whisper
+        with open(mp3_path, "rb") as audio_file:
             transcript = CLIENT.audio.transcriptions.create(
                 model="whisper-1",
-                file=mp3_file,
-                language="ru"
+                file=audio_file,
+                language="ru",
+                response_format="text"
             )
         
-        os.unlink(mp3_path)
-        return transcript.text
+        logger.info(f"Transcription successful: {transcript[:100]}...")
+        return transcript
+        
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
         return ""
+    finally:
+        # Гарантированная очистка временных файлов
+        for path in [ogg_path, mp3_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception as e:
+                    logger.error(f"Error deleting temp file {path}: {e}")
 
 async def synthesize_speech(text: str) -> bytes:
-    """Синтезирует речь (TTS) из текста с помощью Manus TTS."""
+    """Синтезирует речь (TTS) из текста с помощью OpenAI TTS."""
     try:
+        # Ограничиваем длину текста для TTS
+        if len(text) > 1000:
+            text = text[:1000] + "..."
+            
         response = CLIENT.audio.speech.create(
             model="tts-1",
             voice="alloy",
@@ -99,18 +141,53 @@ async def synthesize_speech(text: str) -> bytes:
 
 # --- Telegram Handlers ---
 
-async def start_command(update: Update, context) -> None:
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /start."""
-    await update.message.reply_text('Привет! Я голосовой ассистент на базе Manus. Отправь мне текст или голосовое сообщение, и я отвечу.')
+    welcome_text = """
+👋 Добро пожаловать в кабинет психологической помощи!
 
-async def help_command(update: Update, context) -> None:
+Я - ваш виртуальный психолог. Вы можете:
+• Писать текстовые сообщения
+• Отправлять голосовые сообщения 🎤
+• Получать профессиональную поддержку
+
+Расскажите, что вас беспокоит...
+    """
+    await update.message.reply_text(welcome_text)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает команду /help."""
-    await update.message.reply_text('Просто отправь мне сообщение. Я умею отвечать текстом и голосом.')
+    help_text = """
+💫 Как пользоваться ботом:
 
-async def text_message_handler(update: Update, context) -> None:
+📝 *Текстовые сообщения* - просто напишите ваш вопрос
+🎤 *Голосовые сообщения* - отправьте голосовое сообщение
+⚡ *Быстрые ответы* - я постараюсь ответить быстро и по делу
+
+Кризисная помощь: если вы переживаете острый кризис, пожалуйста, обратитесь к специалистам:
+• Телефон доверия: 8-800-2000-122
+• Экстренная помощь: 112
+    """
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает текстовые сообщения."""
     user_text = update.message.text
     logger.info(f"Received text from user {update.message.from_user.id}: {user_text}")
+    
+    # Проверяем кризисные ситуации
+    crisis_keywords = ['суицид', 'самоубийство', 'умру', 'покончить', 'кризис', 'хочу умереть']
+    if any(keyword in user_text.lower() for keyword in crisis_keywords):
+        crisis_response = """
+🚨 Я понимаю, что вы переживаете тяжелые чувства.
+
+Пожалуйста, обратитесь за немедленной помощью:
+• Телефон доверия: 8-800-2000-122 (круглосуточно)
+• Экстренная психологическая помощь: 112
+• Не оставайтесь один на один с проблемой
+"""
+        await update.message.reply_text(crisis_response)
+        return
     
     # Отправляем "печатает..."
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
@@ -121,7 +198,7 @@ async def text_message_handler(update: Update, context) -> None:
     # Отправляем ответ
     await update.message.reply_text(llm_response)
 
-async def voice_message_handler(update: Update, context) -> None:
+async def voice_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает голосовые сообщения."""
     voice = update.message.voice
     if not voice:
@@ -138,7 +215,7 @@ async def voice_message_handler(update: Update, context) -> None:
     transcribed_text = await transcribe_voice_message(voice_file)
     
     if not transcribed_text:
-        await update.message.reply_text("Не удалось распознать голосовое сообщение. Попробуйте еще раз.")
+        await update.message.reply_text("❌ Не удалось распознать голосовое сообщение. Пожалуйста, попробуйте еще раз или напишите текстом.")
         return
 
     logger.info(f"Transcribed text: {transcribed_text}")
@@ -152,13 +229,18 @@ async def voice_message_handler(update: Update, context) -> None:
     audio_content = await synthesize_speech(llm_response)
 
     if not audio_content:
-        await update.message.reply_text(f"Ответ: {llm_response}\n\nНе удалось синтезировать речь.")
+        # Если TTS не работает, отправляем текстовый ответ
+        await update.message.reply_text(
+            f"🎤 *Вы сказали:* {transcribed_text}\n\n"
+            f"💬 *Мой ответ:* {llm_response}",
+            parse_mode="Markdown"
+        )
         return
 
     # 4. Отправляем голосовое сообщение
     await update.message.reply_voice(
         voice=io.BytesIO(audio_content),
-        caption=f"Ответ на: *{transcribed_text[:30]}...*",
+        caption=f"💬 Ответ на ваше сообщение",
         parse_mode="Markdown"
     )
 
@@ -185,7 +267,7 @@ def main() -> None:
 
     # Запускаем бота
     logger.info("Starting bot...")
-    application.run_polling(poll_interval=1.0)
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
