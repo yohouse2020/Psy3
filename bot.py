@@ -1,11 +1,12 @@
 import os
 import logging
+import subprocess
+import tempfile
+import io
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram import File
-import io
 from openai import OpenAI
-from pydub import AudioSegment
 
 # Настройка логирования
 logging.basicConfig(
@@ -15,15 +16,11 @@ logger = logging.getLogger(__name__)
 
 # Настройки
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-# OpenAI client is configured to use the Manus API endpoint via environment variables
 CLIENT = OpenAI(base_url=os.environ.get("OPENAI_API_BASE"))
-TEMP_DIR = "temp_audio" 
 LLM_MODEL = "gemini-2.5-flash"
 
 if not TELEGRAM_TOKEN:
     logger.error("TELEGRAM_TOKEN environment variable not set.")
-
-os.makedirs(TEMP_DIR, exist_ok=True)
 
 # --- LLM Integration Functions ---
 
@@ -47,23 +44,41 @@ def get_llm_response(prompt: str) -> str:
 async def transcribe_voice_message(voice_file: File) -> str:
     """Скачивает голосовое сообщение, конвертирует и распознает его с помощью Manus STT."""
     try:
-        # 1. Скачивание файла в память
-        voice_bytes = io.BytesIO()
-        await voice_file.download_to_memory(voice_bytes)
-        voice_bytes.seek(0)
+        # 1. Скачивание файла во временную папку
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as ogg_file:
+            ogg_path = ogg_file.name
+        
+        await voice_file.download_to_drive(ogg_path)
+        logger.info(f"Downloaded voice file to {ogg_path}")
 
-        # 2. Конвертация OGG (Telegram) в MP3 (для Manus STT) с помощью pydub
-        audio = AudioSegment.from_file(voice_bytes, format="ogg")
-        mp3_bytes = io.BytesIO()
-        audio.export(mp3_bytes, format="mp3")
-        mp3_bytes.seek(0)
+        # 2. Конвертация OGG (Telegram) в MP3 (для Manus STT) с помощью ffmpeg
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
+            mp3_path = mp3_file.name
+        
+        logger.info(f"Converting audio from {ogg_path} to {mp3_path}")
+        
+        result = subprocess.run(
+            ["ffmpeg", "-i", ogg_path, "-acodec", "libmp3lame", "-ab", "192k", mp3_path, "-y"],
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            logger.error(f"FFmpeg error: {result.stderr}")
+            os.unlink(ogg_path)
+            return ""
+        
+        os.unlink(ogg_path)
 
         # 3. Распознавание речи (STT) с помощью Manus API
-        transcript = CLIENT.audio.transcriptions.create(
-            model="whisper-1", # Используем Whisper для STT
-            file=("voice_message.mp3", mp3_bytes.read(), "audio/mp3"),
-            language="ru"
-        )
+        with open(mp3_path, "rb") as mp3_file:
+            transcript = CLIENT.audio.transcriptions.create(
+                model="whisper-1",
+                file=mp3_file,
+                language="ru"
+            )
+        
+        os.unlink(mp3_path)
         return transcript.text
     except Exception as e:
         logger.error(f"Error during transcription: {e}")
@@ -73,17 +88,16 @@ async def synthesize_speech(text: str) -> bytes:
     """Синтезирует речь (TTS) из текста с помощью Manus TTS."""
     try:
         response = CLIENT.audio.speech.create(
-            model="tts-1", # Используем стандартный TTS
-            voice="alloy", # Выбираем голос
+            model="tts-1",
+            voice="alloy",
             input=text
         )
-        # Возвращаем байты аудиофайла
         return response.content
     except Exception as e:
         logger.error(f"Error during speech synthesis: {e}")
         return b""
 
-# --- Telegram Handlers (Cont.) ---
+# --- Telegram Handlers ---
 
 async def start_command(update: Update, context) -> None:
     """Обрабатывает команду /start."""
@@ -130,12 +144,10 @@ async def voice_message_handler(update: Update, context) -> None:
     logger.info(f"Transcribed text: {transcribed_text}")
     
     # 2. Получаем ответ от LLM
-    # Отправляем "печатает..."
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     llm_response = get_llm_response(transcribed_text)
     
     # 3. Синтезируем речь
-    # Отправляем "запись..."
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="record_audio")
     audio_content = await synthesize_speech(llm_response)
 
@@ -149,9 +161,6 @@ async def voice_message_handler(update: Update, context) -> None:
         caption=f"Ответ на: *{transcribed_text[:30]}...*",
         parse_mode="Markdown"
     )
-
-    # Дополнительно отправляем текстовый ответ, чтобы пользователь видел, что ответила LLM
-    # await update.message.reply_text(llm_response)
 
 # --- Main Application Setup ---
 
